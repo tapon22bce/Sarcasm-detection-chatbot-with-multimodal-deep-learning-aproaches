@@ -1,0 +1,221 @@
+import tensorflow as tf
+from transformers import TFBertModel, BertTokenizer, TFRobertaModel, RobertaTokenizer
+from tensorflow.keras.layers import Input, Dense, Concatenate, Lambda, Dropout
+from tensorflow.keras.models import Model
+from tensorflow.keras.callbacks import ReduceLROnPlateau, EarlyStopping
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.neural_network import MLPClassifier
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# 1. Loading and Preparing Data
+data = pd.read_csv(r"/content/sarcasm_subset_reddit.csv") #/content/sarcasm_subset_reddit.csv
+texts = data['comment'].astype(str).tolist()
+labels = data['label'].values  # Binary labels: 0 for non-sarcastic, 1 for sarcastic
+print(f"Dataset size: {len(texts)} rows")
+
+max_seq_length = 70
+
+# 2. Tokenization using BERT and RoBERTa Tokenizers
+# Initialize tokenizers
+bert_tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+roberta_tokenizer = RobertaTokenizer.from_pretrained('roberta-base')
+
+def tokenize_for_model(tokenizer, texts, max_len):
+    encodings = tokenizer(texts, truncation=True, padding='max_length', max_length=max_len, return_tensors='np')
+    return encodings['input_ids'], encodings['attention_mask']
+
+# Tokenize texts for each model
+X_ids_bert, X_mask_bert = tokenize_for_model(bert_tokenizer, texts, max_seq_length)
+X_ids_roberta, X_mask_roberta = tokenize_for_model(roberta_tokenizer, texts, max_seq_length)
+
+
+# 3. Split Data into Train and Test Sets
+# We assume both tokenizations follow the same order.
+(X_ids_bert_train, X_ids_bert_test,
+ X_mask_bert_train, X_mask_bert_test,
+ X_ids_roberta_train, X_ids_roberta_test,
+ X_mask_roberta_train, X_mask_roberta_test,
+ y_train, y_test) = train_test_split(
+    X_ids_bert, X_mask_bert, X_ids_roberta, X_mask_roberta, labels, test_size=0.2, random_state=42
+)
+
+# Convert arrays to int32
+X_ids_bert_train = np.array(X_ids_bert_train, dtype=np.int32)
+X_mask_bert_train = np.array(X_mask_bert_train, dtype=np.int32)
+X_ids_bert_test  = np.array(X_ids_bert_test, dtype=np.int32)
+X_mask_bert_test  = np.array(X_mask_bert_test, dtype=np.int32)
+
+X_ids_roberta_train = np.array(X_ids_roberta_train, dtype=np.int32)
+X_mask_roberta_train = np.array(X_mask_roberta_train, dtype=np.int32)
+X_ids_roberta_test  = np.array(X_ids_roberta_test, dtype=np.int32)
+X_mask_roberta_test  = np.array(X_mask_roberta_test, dtype=np.int32)
+
+print("Train and test sets created.")
+
+
+# 4. Build the Ensemble Transformer Model for Fine-Tuning and Embedding Extraction
+# Define inputs for BERT branch
+bert_input_ids = Input(shape=(max_seq_length,), dtype=tf.int32, name='bert_input_ids')
+bert_attention  = Input(shape=(max_seq_length,), dtype=tf.int32, name='bert_attention_mask')
+
+# Define inputs for RoBERTa branch
+roberta_input_ids = Input(shape=(max_seq_length,), dtype=tf.int32, name='roberta_input_ids')
+roberta_attention  = Input(shape=(max_seq_length,), dtype=tf.int32, name='roberta_attention_mask')
+
+# BERT branch: load pretrained BERT and unfreeze layers for fine-tuning
+bert_model = TFBertModel.from_pretrained('bert-base-uncased', from_pt=False)
+for layer in bert_model.layers:
+    layer.trainable = True
+
+def bert_branch(inputs):
+    input_ids, attention_mask = inputs
+    outputs = bert_model(input_ids=input_ids, attention_mask=attention_mask)
+    return outputs.pooler_output  # shape: (batch_size, 768)
+
+bert_output = Lambda(bert_branch, output_shape=(768,))([bert_input_ids, bert_attention])
+
+# RoBERTa branch: load pretrained RoBERTa and unfreeze layers for fine-tuning
+roberta_model = TFRobertaModel.from_pretrained('roberta-base')
+for layer in roberta_model.layers:
+    layer.trainable = True
+
+def roberta_branch(inputs):
+    input_ids, attention_mask = inputs
+    outputs = roberta_model(input_ids=input_ids, attention_mask=attention_mask)
+    return outputs.last_hidden_state[:, 0, :]  # extract CLS token, shape: (batch_size, 768)
+
+roberta_output = Lambda(roberta_branch, output_shape=(768,))([roberta_input_ids, roberta_attention])
+
+# Concatenate embeddings from both branches -> shape: (batch_size, 1536)
+combined_embedding = Concatenate()([bert_output, roberta_output])
+
+# Add Dense Layers with Dropout for fine-tuning
+x = Dense(128, activation='relu')(combined_embedding)
+x = Dropout(0.3)(x)
+x = Dense(64, activation='relu')(x)
+x = Dropout(0.3)(x)
+classifier_output = Dense(1, activation='sigmoid', name='classifier_output')(x)
+
+# Build the full ensemble model (with classification head)
+ensemble_model = Model(
+    inputs=[bert_input_ids, bert_attention, roberta_input_ids, roberta_attention],
+    outputs=classifier_output
+)
+ensemble_model.summary()
+
+
+# 5. Compile and Train the Ensemble Model (Fine-Tuning)
+optimizer = tf.keras.optimizers.Adam(learning_rate=3e-5)
+ensemble_model.compile(optimizer=optimizer,
+                       loss='binary_crossentropy',
+                       metrics=['accuracy'])
+
+# Callbacks for training
+lr_scheduler = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=2, verbose=1)
+early_stopper = EarlyStopping(monitor='val_loss', patience=4, restore_best_weights=True)
+
+history = ensemble_model.fit(
+    [X_ids_bert_train, X_mask_bert_train, X_ids_roberta_train, X_mask_roberta_train],
+    y_train,
+    validation_split=0.1,
+    epochs=1,
+    batch_size=16,
+    callbacks=[lr_scheduler, early_stopper]
+)
+
+# 6. Extract Embeddings from the Fine-Tuned Ensemble
+# Create a model that outputs the concatenated embedding (before the classifier head)
+embedding_extractor = Model(
+    inputs=[bert_input_ids, bert_attention, roberta_input_ids, roberta_attention],
+    outputs=combined_embedding  # 1536-dim embeddings
+)
+train_embeddings = embedding_extractor.predict(
+    [X_ids_bert_train, X_mask_bert_train, X_ids_roberta_train, X_mask_roberta_train],
+    batch_size=32, verbose=1
+)
+test_embeddings = embedding_extractor.predict(
+    [X_ids_bert_test, X_mask_bert_test, X_ids_roberta_test, X_mask_roberta_test],
+    batch_size=32, verbose=1
+)
+print("Train embeddings shape:", train_embeddings.shape)
+print("Test embeddings shape:", test_embeddings.shape)
+
+# 7. Train an MLP Classifier on Extracted Embeddings
+from sklearn.neural_network import MLPClassifier
+
+# Define an MLP classifier with 2 hidden layers (adjust as needed)
+mlp_clf = MLPClassifier(hidden_layer_sizes=(128, 64), max_iter=1000, learning_rate_init=1e-3, random_state=42)
+mlp_clf.fit(train_embeddings, y_train)
+
+
+# 8. Evaluate the MLP Classifier
+preds = mlp_clf.predict(test_embeddings)
+
+acc = accuracy_score(y_test, preds)
+prec = precision_score(y_test, preds)
+rec = recall_score(y_test, preds)
+f1 = f1_score(y_test, preds)
+
+print("Evaluation Metrics for MLP Classifier on Transformer Embeddings:")
+print(f"Accuracy:  {acc:.4f}")
+print(f"Precision: {prec:.4f}")
+print(f"Recall:    {rec:.4f}")
+print(f"F1 Score:  {f1:.4f}")
+print("\nClassification Report:")
+print(classification_report(y_test, preds, target_names=['Non-Sarcastic', 'Sarcastic']))
+
+
+# 9. Plot Confusion Matrix and Evaluation Metrics
+cm = confusion_matrix(y_test, preds)
+plt.figure(figsize=(6,5))
+sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+            xticklabels=["Non-Sarcastic", "Sarcastic"],
+            yticklabels=["Non-Sarcastic", "Sarcastic"])
+plt.xlabel("Predicted Label")
+plt.ylabel("True Label")
+plt.title("Confusion Matrix for MLP Classifier")
+plt.show()
+
+metrics_dict = {'Accuracy': acc, 'Precision': prec, 'Recall': rec, 'F1 Score': f1}
+plt.figure(figsize=(8,5))
+sns.barplot(x=list(metrics_dict.keys()), y=list(metrics_dict.values()), palette="viridis")
+plt.ylim(0, 1)
+plt.ylabel("Score")
+plt.title("Evaluation Metrics for MLP Classifier")
+plt.show()
+
+
+import gradio as gr
+import numpy as np
+
+def predict_sarcasm(text):
+    # Tokenize using BERT tokenizer
+    enc_bert = bert_tokenizer(text, truncation=True, padding='max_length', max_length=max_seq_length, return_tensors="np")
+    input_ids_bert = np.array(enc_bert['input_ids'], dtype=np.int32)
+    attention_mask_bert = np.array(enc_bert['attention_mask'], dtype=np.int32)
+
+    # Tokenize using RoBERTa tokenizer
+    enc_roberta = roberta_tokenizer(text, truncation=True, padding='max_length', max_length=max_seq_length, return_tensors="np")
+    input_ids_roberta = np.array(enc_roberta['input_ids'], dtype=np.int32)
+    attention_mask_roberta = np.array(enc_roberta['attention_mask'], dtype=np.int32)
+
+    # Extract embeddings from the fine-tuned ensemble model
+    emb = embedding_extractor.predict([input_ids_bert, attention_mask_bert, input_ids_roberta, attention_mask_roberta])
+
+    # Use the MLP classifier to predict
+    pred = mlp_clf.predict(emb)
+    return "Sarcastic😏" if pred[0] == 1 else "Not Sarcastic😊"
+
+iface = gr.Interface(
+    fn=predict_sarcasm,
+    inputs="text",
+    outputs="text",
+    title="Sarcasm Detector Chatbot 🤖",
+    description="Enter a sentence to see if it is sarcastic or not."
+)
+
+iface.launch()
